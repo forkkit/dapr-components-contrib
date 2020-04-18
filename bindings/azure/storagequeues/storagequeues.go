@@ -7,18 +7,24 @@ package storagequeues
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/Azure/azure-storage-queue-go/azqueue"
 	"github.com/dapr/components-contrib/bindings"
-	log "github.com/sirupsen/logrus"
+	"github.com/dapr/dapr/pkg/logger"
+)
+
+const (
+	defaultTTL = time.Minute * 10
 )
 
 type consumer struct {
@@ -27,25 +33,28 @@ type consumer struct {
 
 // QueueHelper enables injection for testnig
 type QueueHelper interface {
-	Init(accountName string, accountKey string, queueName string) error
-	Write(data []byte) error
+	Init(accountName string, accountKey string, queueName string, decodeBase64 bool) error
+	Write(data []byte, ttl *time.Duration) error
 	Read(ctx context.Context, consumer *consumer) error
 }
 
 // AzureQueueHelper concrete impl of queue helper
 type AzureQueueHelper struct {
-	credential *azqueue.SharedKeyCredential
-	queueURL   azqueue.QueueURL
-	reqURI     string
+	credential   *azqueue.SharedKeyCredential
+	queueURL     azqueue.QueueURL
+	reqURI       string
+	logger       logger.Logger
+	decodeBase64 bool
 }
 
 // Init sets up this helper
-func (d *AzureQueueHelper) Init(accountName string, accountKey string, queueName string) error {
+func (d *AzureQueueHelper) Init(accountName string, accountKey string, queueName string, decodeBase64 bool) error {
 	credential, err := azqueue.NewSharedKeyCredential(accountName, accountKey)
 	if err != nil {
 		return err
 	}
 	d.credential = credential
+	d.decodeBase64 = decodeBase64
 	u, _ := url.Parse(fmt.Sprintf(d.reqURI, accountName, queueName))
 	d.queueURL = azqueue.NewQueueURL(*u, azqueue.NewPipeline(credential, azqueue.PipelineOptions{}))
 	ctx := context.TODO()
@@ -56,11 +65,16 @@ func (d *AzureQueueHelper) Init(accountName string, accountKey string, queueName
 	return nil
 }
 
-func (d *AzureQueueHelper) Write(data []byte) error {
+func (d *AzureQueueHelper) Write(data []byte, ttl *time.Duration) error {
 	ctx := context.TODO()
 	messagesURL := d.queueURL.NewMessagesURL()
 	s := string(data)
-	_, err := messagesURL.Enqueue(ctx, s, time.Second*0, time.Minute*10)
+
+	if ttl == nil {
+		ttlToUse := defaultTTL
+		ttl = &ttlToUse
+	}
+	_, err := messagesURL.Enqueue(ctx, s, time.Second*0, *ttl)
 	return err
 }
 
@@ -76,8 +90,21 @@ func (d *AzureQueueHelper) Read(ctx context.Context, consumer *consumer) error {
 		return nil
 	}
 	mt := res.Message(0).Text
+
+	var data []byte
+
+	if d.decodeBase64 {
+		decoded, decodeError := base64.StdEncoding.DecodeString(strings.Trim(mt, "\""))
+		if decodeError != nil {
+			return decodeError
+		}
+		data = decoded
+	} else {
+		data = []byte(mt)
+	}
+
 	err = consumer.callback(&bindings.ReadResponse{
-		Data:     []byte(mt),
+		Data:     data,
 		Metadata: map[string]string{},
 	})
 	if err != nil {
@@ -93,25 +120,32 @@ func (d *AzureQueueHelper) Read(ctx context.Context, consumer *consumer) error {
 }
 
 // NewAzureQueueHelper creates new helper
-func NewAzureQueueHelper() QueueHelper {
-	return &AzureQueueHelper{reqURI: "https://%s.queue.core.windows.net/%s"}
+func NewAzureQueueHelper(logger logger.Logger) QueueHelper {
+	return &AzureQueueHelper{
+		reqURI: "https://%s.queue.core.windows.net/%s",
+		logger: logger,
+	}
 }
 
 // AzureStorageQueues is an input/output binding reading from and sending events to Azure Storage queues
 type AzureStorageQueues struct {
 	metadata *storageQueuesMetadata
 	helper   QueueHelper
+
+	logger logger.Logger
 }
 
 type storageQueuesMetadata struct {
-	AccountKey  string `json:"storageAccessKey"`
-	QueueName   string `json:"queue"`
-	AccountName string `json:"storageAccount"`
+	AccountKey   string `json:"storageAccessKey"`
+	QueueName    string `json:"queue"`
+	AccountName  string `json:"storageAccount"`
+	DecodeBase64 string `json:"decodeBase64"`
+	ttl          *time.Duration
 }
 
 // NewAzureStorageQueues returns a new AzureStorageQueues instance
-func NewAzureStorageQueues() *AzureStorageQueues {
-	return &AzureStorageQueues{helper: NewAzureQueueHelper()}
+func NewAzureStorageQueues(logger logger.Logger) *AzureStorageQueues {
+	return &AzureStorageQueues{helper: NewAzureQueueHelper(logger), logger: logger}
 }
 
 // Init parses connection properties and creates a new Storage Queue client
@@ -122,7 +156,12 @@ func (a *AzureStorageQueues) Init(metadata bindings.Metadata) error {
 	}
 	a.metadata = meta
 
-	err = a.helper.Init(a.metadata.AccountName, a.metadata.AccountKey, a.metadata.QueueName)
+	decodeBase64 := false
+	if a.metadata.DecodeBase64 == "true" {
+		decodeBase64 = true
+	}
+
+	err = a.helper.Init(a.metadata.AccountName, a.metadata.AccountKey, a.metadata.QueueName, decodeBase64)
 	if err != nil {
 		return err
 	}
@@ -139,11 +178,31 @@ func (a *AzureStorageQueues) parseMetadata(metadata bindings.Metadata) (*storage
 	if err != nil {
 		return nil, err
 	}
+
+	ttl, ok, err := bindings.TryGetTTL(metadata.Properties)
+	if err != nil {
+		return nil, err
+	}
+
+	if ok {
+		m.ttl = &ttl
+	}
+
 	return &m, nil
 }
 
 func (a *AzureStorageQueues) Write(req *bindings.WriteRequest) error {
-	err := a.helper.Write(req.Data)
+	ttlToUse := a.metadata.ttl
+	ttl, ok, err := bindings.TryGetTTL(req.Metadata)
+	if err != nil {
+		return err
+	}
+
+	if ok {
+		ttlToUse = &ttl
+	}
+
+	err = a.helper.Write(req.Data, ttlToUse)
 	if err != nil {
 		return err
 	}
@@ -162,7 +221,7 @@ func (a *AzureStorageQueues) Read(handler func(*bindings.ReadResponse) error) er
 		for {
 			err := a.helper.Read(ctx, &c)
 			if err != nil {
-				log.Errorf("error from c: %s", err)
+				a.logger.Errorf("error from c: %s", err)
 			}
 			if ctx.Err() != nil {
 				return
